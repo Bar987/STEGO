@@ -13,6 +13,7 @@ from pytorch_lightning.utilities.seed import seed_everything
 import torch.multiprocessing
 import seaborn as sns
 from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import WandbLogger
 import sys
 
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -461,10 +462,7 @@ def my_app(cfg: DictConfig) -> None:
 
     model = LitUnsupervisedSegmenter(train_dataset.n_classes, cfg)
 
-    tb_logger = TensorBoardLogger(
-        join(log_dir, name),
-        default_hp_metric=False
-    )
+    logger = WandbLogger(project="dipterv", log_model="all")
 
     if cfg.submitting_to_aml:
         gpu_args = dict(gpus=1, val_check_interval=250)
@@ -481,7 +479,7 @@ def my_app(cfg: DictConfig) -> None:
 
     trainer = Trainer(
         log_every_n_steps=cfg.scalar_log_freq,
-        logger=tb_logger,
+        logger=logger,
         max_steps=cfg.max_steps,
         callbacks=[
             ModelCheckpoint(
