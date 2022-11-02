@@ -37,8 +37,8 @@ def add_plot(writer, name, step):
     plt.savefig(buf, format='jpeg', dpi=100)
     buf.seek(0)
     image = Image.open(buf)
-    image = T.ToTensor()(image)
-    writer.add_image(name, image, step)
+    image = [T.ToTensor()(image)]
+    writer.log_image(name, image, step)
     plt.clf()
     plt.close()
 

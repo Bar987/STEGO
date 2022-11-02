@@ -18,7 +18,7 @@ import sys
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-def get_class_labels(dataset_name):
+def get_class_labels(dataset_name, n_classes):
     if dataset_name.startswith("cityscapes"):
         return [
             'road', 'sidewalk', 'parking', 'rail track', 'building',
@@ -47,6 +47,8 @@ def get_class_labels(dataset_name):
             'roads and cars',
             'buildings and clutter',
             'trees and vegetation']
+    elif dataset_name == "directory":
+        return [str(i) for i in range(n_classes)]
     else:
         raise ValueError("Unknown Dataset {}".format(dataset_name))
 
@@ -197,7 +199,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                 norm(sample(code, downsampled_coord_aug)),
                 norm(orig_code_aug)
             ).mean()
-            self.log('loss/aug_alignment', aug_alignment, **log_args)
+            self.log('loss/aug_alignment', aug_alignment, **log_argsget_class_labels)
             loss += self.cfg.aug_alignment_weight * aug_alignment
 
         if self.cfg.crf_weight > 0:
@@ -250,7 +252,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             **self.linear_metrics.compute(),
             **self.cluster_metrics.compute()
         }
-        self.logger.log_hyperparams(self.cfg, tb_metrics)
+        self.logger.log_hyperparams(self.cfg)
 
     def validation_step(self, batch, batch_idx):
         img = batch["img"]
@@ -291,7 +293,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                 fig, ax = plt.subplots(4, self.cfg.n_images, figsize=(self.cfg.n_images * 3, 4 * 3))
                 for i in range(self.cfg.n_images):
                     ax[0, i].imshow(prep_for_plot(output["img"][i]))
-                    ax[1, i].imshow(self.label_cmap[output["label"][i]])
+                    ax[1, i].imshow(np.squeeze(self.label_cmap[output["label"][i]]))
                     ax[2, i].imshow(self.label_cmap[output["linear_preds"][i]])
                     ax[3, i].imshow(self.label_cmap[self.cluster_metrics.map_clusters(output["cluster_preds"][i])])
                 ax[0, 0].set_ylabel("Image", fontsize=16)
@@ -300,7 +302,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                 ax[3, 0].set_ylabel("Cluster Probe", fontsize=16)
                 remove_axes(ax)
                 plt.tight_layout()
-                add_plot(self.logger.experiment, "plot_labels", self.global_step)
+                add_plot(self.logger, "plot_labels", self.global_step)
 
                 if self.cfg.has_labels:
                     fig = plt.figure(figsize=(13, 10))
@@ -310,7 +312,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                     sns.heatmap(hist.t(), annot=False, fmt='g', ax=ax, cmap="Blues")
                     ax.set_xlabel('Predicted labels')
                     ax.set_ylabel('True labels')
-                    names = get_class_labels(self.cfg.dataset_name)
+                    names = get_class_labels(self.cfg.dataset_name, self.n_classes)
                     if self.cfg.extra_clusters:
                         names = names + ["Extra"]
                     ax.set_xticks(np.arange(0, len(names)) + .5)
@@ -328,7 +330,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                     ax.vlines(np.arange(0, len(names) + 1), color=[.5, .5, .5], *ax.get_xlim())
                     ax.hlines(np.arange(0, len(names) + 1), color=[.5, .5, .5], *ax.get_ylim())
                     plt.tight_layout()
-                    add_plot(self.logger.experiment, "conf_matrix", self.global_step)
+                    add_plot(self.logger, "conf_matrix", self.global_step)
 
                     all_bars = torch.cat([
                         self.cluster_metrics.histogram.sum(0).cpu(),
@@ -357,7 +359,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                     ax[1].tick_params(axis='x', labelrotation=90)
 
                     plt.tight_layout()
-                    add_plot(self.logger.experiment, "label frequency", self.global_step)
+                    add_plot(self.logger, "label frequency", self.global_step)
 
             if self.global_step > 2:
                 self.log_dict(tb_metrics)

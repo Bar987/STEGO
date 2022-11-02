@@ -1,8 +1,8 @@
 name: dipterv
 channels:
-- anaconda
-- pytorch
 - conda-forge
+- pytorch
+- anaconda
 - menpo
 dependencies:
 - python=3.6.9
