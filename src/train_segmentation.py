@@ -464,7 +464,7 @@ def my_app(cfg: DictConfig) -> None:
 
     model = LitUnsupervisedSegmenter(train_dataset.n_classes, cfg)
 
-    logger = WandbLogger(project="dipterv", log_model="all")
+    logger = WandbLogger(project="dipterv", log_model="all", name=cfg.run_name)
 
     if cfg.submitting_to_aml:
         gpu_args = dict(gpus=1, val_check_interval=250)
