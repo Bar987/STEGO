@@ -15,6 +15,8 @@ import seaborn as sns
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 import sys
+from crf import dense_crf
+from multiprocessing import Pool
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -99,6 +101,8 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             p.requires_grad = False
 
         self.automatic_optimization = False
+
+        self.use_crf_in_val = cfg.use_crf_in_val
 
         if self.cfg.dataset_name.startswith("cityscapes"):
             self.label_cmap = create_cityscapes_colormap()
@@ -239,11 +243,11 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             self.trainer.optimizers[1] = torch.optim.Adam(list(self.linear_probe.parameters()), lr=5e-3)
             self.trainer.optimizers[2] = torch.optim.Adam(list(self.cluster_probe.parameters()), lr=5e-3)
 
-        if self.global_step % 2000 == 0 and self.global_step > 0:
-            print("RESETTING TFEVENT FILE")
-            # Make a new tfevent file
-            self.logger.experiment.close()
-            self.logger.experiment._get_file_writer()
+        # if self.global_step % 2000 == 0 and self.global_step > 0:
+        #     print("RESETTING TFEVENT FILE")
+        #     # Make a new tfevent file
+        #     self.logger.experiment.close()
+        #     self.logger.experiment._get_file_writer()
 
         return loss
 
@@ -263,13 +267,26 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             feats, code = self.net(img)
             code = F.interpolate(code, label.shape[-2:], mode='bilinear', align_corners=False)
 
-            linear_preds = self.linear_probe(code)
-            linear_preds = linear_preds.argmax(1)
-            self.linear_metrics.update(linear_preds, label)
 
-            cluster_loss, cluster_preds = self.cluster_probe(code, None)
-            cluster_preds = cluster_preds.argmax(1)
-            self.cluster_metrics.update(cluster_preds, label)
+            if self.use_crf_in_val:
+                with Pool(7) as pool:
+
+                    linear_probs = torch.log_softmax(self.linear_probe(code), dim=1)
+                    cluster_probs = self.cluster_probe(code, 2, log_probs=True)
+
+                    linear_preds = batched_crf(pool, img, linear_probs).argmax(1).cuda()
+                    cluster_preds = batched_crf(pool, img, cluster_probs).argmax(1).cuda()
+
+                    self.linear_metrics.update(linear_preds, label)
+                    self.cluster_metrics.update(cluster_preds, label)
+            else:
+                linear_preds = self.linear_probe(code)
+                linear_preds = linear_preds.argmax(1)
+                self.linear_metrics.update(linear_preds, label)
+
+                cluster_loss, cluster_preds = self.cluster_probe(code, None)
+                cluster_preds = cluster_preds.argmax(1)
+                self.cluster_metrics.update(cluster_preds, label)
 
             return {
                 'img': img[:self.cfg.n_images].detach().cpu(),
@@ -332,34 +349,34 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                     plt.tight_layout()
                     add_plot(self.logger, "conf_matrix", self.global_step)
 
-                    all_bars = torch.cat([
-                        self.cluster_metrics.histogram.sum(0).cpu(),
-                        self.cluster_metrics.histogram.sum(1).cpu()
-                    ], axis=0)
-                    ymin = max(all_bars.min() * .8, 1)
-                    ymax = all_bars.max() * 1.2
+                    # all_bars = torch.cat([
+                    #     self.cluster_metrics.histogram.sum(0).cpu(),
+                    #     self.cluster_metrics.histogram.sum(1).cpu()
+                    # ], axis=0)
+                    # ymin = max(all_bars.min() * .8, 1)
+                    # ymax = all_bars.max() * 1.2
 
-                    fig, ax = plt.subplots(1, 2, figsize=(2 * 5, 1 * 4))
-                    ax[0].bar(range(self.n_classes + self.cfg.extra_clusters),
-                              self.cluster_metrics.histogram.sum(0).cpu(),
-                              tick_label=names,
-                              color=colors)
-                    ax[0].set_ylim(ymin, ymax)
-                    ax[0].set_title("Label Frequency")
-                    ax[0].set_yscale('log')
-                    ax[0].tick_params(axis='x', labelrotation=90)
+                    # fig, ax = plt.subplots(1, 2, figsize=(2 * 5, 1 * 4))
+                    # ax[0].bar(range(self.n_classes + self.cfg.extra_clusters),
+                    #           self.cluster_metrics.histogram.sum(0).cpu(),
+                    #           tick_label=names,
+                    #           color=colors)
+                    # ax[0].set_ylim(ymin, ymax)
+                    # ax[0].set_title("Label Frequency")
+                    # ax[0].set_yscale('log')
+                    # ax[0].tick_params(axis='x', labelrotation=90)
 
-                    ax[1].bar(range(self.n_classes + self.cfg.extra_clusters),
-                              self.cluster_metrics.histogram.sum(1).cpu(),
-                              tick_label=names,
-                              color=colors)
-                    ax[1].set_ylim(ymin, ymax)
-                    ax[1].set_title("Cluster Frequency")
-                    ax[1].set_yscale('log')
-                    ax[1].tick_params(axis='x', labelrotation=90)
+                    # ax[1].bar(range(self.n_classes + self.cfg.extra_clusters),
+                    #           self.cluster_metrics.histogram.sum(1).cpu(),
+                    #           tick_label=names,
+                    #           color=colors)
+                    # ax[1].set_ylim(ymin, ymax)
+                    # ax[1].set_title("Cluster Frequency")
+                    # ax[1].set_yscale('log')
+                    # ax[1].tick_params(axis='x', labelrotation=90)
 
-                    plt.tight_layout()
-                    add_plot(self.logger, "label frequency", self.global_step)
+                    # plt.tight_layout()
+                    # add_plot(self.logger, "label frequency", self.global_step)
 
             if self.global_step > 2:
                 self.log_dict(tb_metrics)
@@ -385,6 +402,14 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
         return net_optim, linear_probe_optim, cluster_probe_optim
 
+
+def _apply_crf(tup):
+    return dense_crf(tup[0], tup[1])
+
+
+def batched_crf(pool, img_tensor, prob_tensor):
+    outputs = pool.map(_apply_crf, zip(img_tensor.detach().cpu(), prob_tensor.detach().cpu()))
+    return torch.cat([torch.from_numpy(arr).unsqueeze(0) for arr in outputs], dim=0)
 
 @hydra.main(config_path="configs", config_name="train_config.yml")
 def my_app(cfg: DictConfig) -> None:
