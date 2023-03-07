@@ -17,6 +17,7 @@ from pytorch_lightning.loggers import WandbLogger
 import sys
 from crf import dense_crf
 from multiprocessing import Pool
+import math
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -119,6 +120,11 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         # training_step defined the train loop.
         # It is independent of forward
+        if self.cfg.freeze_segmenter:
+            self.net.eval()
+        else:
+            self.net.train()
+
         net_optim, linear_probe_optim, cluster_probe_optim = self.optimizers()
 
         net_optim.zero_grad()
@@ -223,8 +229,10 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         linear_logits = F.interpolate(linear_logits, label.shape[-2:], mode='bilinear', align_corners=False)
         linear_logits = linear_logits.permute(0, 2, 3, 1).reshape(-1, self.n_classes)
         linear_loss = self.linear_probe_loss_fn(linear_logits[mask], flat_label[mask]).mean()
-        loss += linear_loss
-        self.log('loss/linear', linear_loss, **log_args)
+
+        if not math.isnan(linear_loss):
+            loss += linear_loss
+            self.log('loss/linear', linear_loss, **log_args)
 
         cluster_loss, cluster_probs = self.cluster_probe(detached_code, None)
         loss += cluster_loss
@@ -287,6 +295,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                 cluster_loss, cluster_preds = self.cluster_probe(code, None)
                 cluster_preds = cluster_preds.argmax(1)
                 self.cluster_metrics.update(cluster_preds, label)
+                self.log('test/loss/cluster', cluster_loss)
 
             return {
                 'img': img[:self.cfg.n_images].detach().cpu(),
@@ -308,7 +317,8 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                 output = {k: v.detach().cpu() for k, v in outputs[output_num].items()}
 
                 fig, ax = plt.subplots(4, self.cfg.n_images, figsize=(self.cfg.n_images * 3, 4 * 3))
-                for i in range(self.cfg.n_images):
+                num_of_sample = self.cfg.n_images if self.cfg.n_images < len(output["img"]) else len(output["img"])
+                for i in range(num_of_sample):
                     ax[0, i].imshow(prep_for_plot(output["img"][i]))
                     ax[1, i].imshow(np.squeeze(self.label_cmap[output["label"][i]]))
                     ax[2, i].imshow(self.label_cmap[output["linear_preds"][i]])
@@ -486,8 +496,11 @@ def my_app(cfg: DictConfig) -> None:
         val_batch_size = cfg.batch_size
 
     val_loader = DataLoader(val_dataset, val_batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
-
-    model = LitUnsupervisedSegmenter(train_dataset.n_classes, cfg)
+    
+    if cfg.checkpoint_file is None:
+        model = LitUnsupervisedSegmenter(train_dataset.n_classes, cfg)
+    else:
+        model = LitUnsupervisedSegmenter.load_from_checkpoint(cfg.output_root + "/checkpoints/" + cfg.checkpoint_file, cfg=cfg)
 
     logger = WandbLogger(project="dipterv", log_model="all", name=cfg.run_name)
 
@@ -511,10 +524,10 @@ def my_app(cfg: DictConfig) -> None:
         callbacks=[
             ModelCheckpoint(
                 dirpath=join(checkpoint_dir, name),
-                every_n_train_steps=400,
-                save_top_k=2,
-                monitor="test/cluster/mIoU",
-                mode="max",
+                every_n_train_steps=cfg.checkpoint_freq,
+                save_top_k=1,
+                monitor=cfg.checkpoint_monitor,
+                mode=cfg.checkpoint_mode,
             )
         ],
         **gpu_args
