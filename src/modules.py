@@ -27,13 +27,6 @@ class DinoFeaturizer(nn.Module):
         self.model = vits.__dict__[arch](
             patch_size=patch_size,
             num_classes=0)
-
-        if cfg.freeze_backbone:
-            for p in self.model.parameters():
-                p.requires_grad = False
-            self.model.eval().cuda()
-        else:
-            self.model.cuda()
         
         self.dropout = torch.nn.Dropout2d(p=.1)
 
@@ -74,6 +67,13 @@ class DinoFeaturizer(nn.Module):
 
         self.cluster1 = self.make_clusterer(self.n_feats)
         self.cluster2 = self.make_nonlinear_clusterer(self.n_feats)
+
+        if cfg.freeze_backbone:
+            for p in self.model.parameters():
+                p.requires_grad = False
+            self.model.eval().cuda()
+        else:
+            self.model.cuda()
 
         if self.cfg.freeze_segmenter:
             for p in self.cluster1.parameters():

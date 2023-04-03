@@ -1,7 +1,7 @@
 from utils import *
 from modules import *
 from data import *
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler
 import torch.nn.functional as F
 from datetime import datetime
 import hydra
@@ -18,6 +18,7 @@ import sys
 from crf import dense_crf
 from multiprocessing import Pool
 import math
+from segmentation_models_pytorch.losses import *
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -93,7 +94,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         self.test_linear_metrics = UnsupervisedMetrics(
             "final/linear/", n_classes, 0, False)
 
-        self.linear_probe_loss_fn = torch.nn.CrossEntropyLoss()
+        self.linear_probe_loss_fn = DiceLoss('multiclass', from_logits=True)
         self.crf_loss_fn = ContrastiveCRFLoss(
             cfg.crf_samples, cfg.alpha, cfg.beta, cfg.gamma, cfg.w1, cfg.w2, cfg.shift)
 
@@ -134,15 +135,15 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         with torch.no_grad():
             ind = batch["ind"]
             img = batch["img"]
-            img_aug = batch["img_aug"]
-            coord_aug = batch["coord_aug"]
             img_pos = batch["img_pos"]
             label = batch["label"]
             label_pos = batch["label_pos"]
 
         feats, code = self.net(img)
+
         if self.cfg.correspondence_weight > 0:
             feats_pos, code_pos = self.net(img_pos)
+
         log_args = dict(sync_dist=False, rank_zero_only=True)
 
         if self.cfg.use_true_labels:
@@ -199,19 +200,6 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             self.log('loss/rec', rec_loss, **log_args)
             loss += self.cfg.rec_weight * rec_loss
 
-        if self.cfg.aug_alignment_weight > 0:
-            orig_feats_aug, orig_code_aug = self.net(img_aug)
-            downsampled_coord_aug = resize(
-                coord_aug.permute(0, 3, 1, 2),
-                orig_code_aug.shape[2]).permute(0, 2, 3, 1)
-            aug_alignment = -torch.einsum(
-                "bkhw,bkhw->bhw",
-                norm(sample(code, downsampled_coord_aug)),
-                norm(orig_code_aug)
-            ).mean()
-            self.log('loss/aug_alignment', aug_alignment, **log_argsget_class_labels)
-            loss += self.cfg.aug_alignment_weight * aug_alignment
-
         if self.cfg.crf_weight > 0:
             crf = self.crf_loss_fn(
                 resize(img, 56),
@@ -228,7 +216,11 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         linear_logits = self.linear_probe(detached_code)
         linear_logits = F.interpolate(linear_logits, label.shape[-2:], mode='bilinear', align_corners=False)
         linear_logits = linear_logits.permute(0, 2, 3, 1).reshape(-1, self.n_classes)
-        linear_loss = self.linear_probe_loss_fn(linear_logits[mask], flat_label[mask]).mean()
+        
+        if len(flat_label[mask]) > 0:
+            linear_loss = self.linear_probe_loss_fn(linear_logits[mask], flat_label[mask])
+        else:
+            linear_loss = 0
 
         if not math.isnan(linear_loss):
             loss += linear_loss
@@ -250,13 +242,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             self.cluster_probe.reset_parameters()
             self.trainer.optimizers[1] = torch.optim.Adam(list(self.linear_probe.parameters()), lr=5e-3)
             self.trainer.optimizers[2] = torch.optim.Adam(list(self.cluster_probe.parameters()), lr=5e-3)
-
-        # if self.global_step % 2000 == 0 and self.global_step > 0:
-        #     print("RESETTING TFEVENT FILE")
-        #     # Make a new tfevent file
-        #     self.logger.experiment.close()
-        #     self.logger.experiment._get_file_writer()
-
+            
         return loss
 
     def on_train_start(self):
@@ -350,43 +336,12 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                     colors = [self.label_cmap[i] / 255.0 for i in range(len(names))]
                     [t.set_color(colors[i]) for i, t in enumerate(ax.xaxis.get_ticklabels())]
                     [t.set_color(colors[i]) for i, t in enumerate(ax.yaxis.get_ticklabels())]
-                    # ax.yaxis.get_ticklabels()[-1].set_color(self.label_cmap[0] / 255.0)
-                    # ax.xaxis.get_ticklabels()[-1].set_color(self.label_cmap[0] / 255.0)
                     plt.xticks(rotation=90)
                     plt.yticks(rotation=0)
                     ax.vlines(np.arange(0, len(names) + 1), color=[.5, .5, .5], *ax.get_xlim())
                     ax.hlines(np.arange(0, len(names) + 1), color=[.5, .5, .5], *ax.get_ylim())
                     plt.tight_layout()
                     add_plot(self.logger, "conf_matrix", self.global_step)
-
-                    # all_bars = torch.cat([
-                    #     self.cluster_metrics.histogram.sum(0).cpu(),
-                    #     self.cluster_metrics.histogram.sum(1).cpu()
-                    # ], axis=0)
-                    # ymin = max(all_bars.min() * .8, 1)
-                    # ymax = all_bars.max() * 1.2
-
-                    # fig, ax = plt.subplots(1, 2, figsize=(2 * 5, 1 * 4))
-                    # ax[0].bar(range(self.n_classes + self.cfg.extra_clusters),
-                    #           self.cluster_metrics.histogram.sum(0).cpu(),
-                    #           tick_label=names,
-                    #           color=colors)
-                    # ax[0].set_ylim(ymin, ymax)
-                    # ax[0].set_title("Label Frequency")
-                    # ax[0].set_yscale('log')
-                    # ax[0].tick_params(axis='x', labelrotation=90)
-
-                    # ax[1].bar(range(self.n_classes + self.cfg.extra_clusters),
-                    #           self.cluster_metrics.histogram.sum(1).cpu(),
-                    #           tick_label=names,
-                    #           color=colors)
-                    # ax[1].set_ylim(ymin, ymax)
-                    # ax[1].set_title("Cluster Frequency")
-                    # ax[1].set_yscale('log')
-                    # ax[1].tick_params(axis='x', labelrotation=90)
-
-                    # plt.tight_layout()
-                    # add_plot(self.logger, "label frequency", self.global_step)
 
             if self.global_step > 2:
                 self.log_dict(tb_metrics)
@@ -447,11 +402,6 @@ def my_app(cfg: DictConfig) -> None:
         T.RandomHorizontalFlip(),
         T.RandomResizedCrop(size=cfg.res, scale=(0.8, 1.0))
     ])
-    photometric_transforms = T.Compose([
-        T.ColorJitter(brightness=.3, contrast=.3, saturation=.3, hue=.1),
-        T.RandomGrayscale(.2),
-        T.RandomApply([T.GaussianBlur((5, 5))])
-    ])
 
     sys.stdout.flush()
 
@@ -464,12 +414,21 @@ def my_app(cfg: DictConfig) -> None:
         target_transform=get_transform(cfg.res, True, cfg.loader_crop_type),
         cfg=cfg,
         aug_geometric_transform=geometric_transforms,
-        aug_photometric_transform=photometric_transforms,
         num_neighbors=cfg.num_neighbors,
         mask=True,
         pos_images=True,
         pos_labels=True
     )
+
+    batch_size = cfg.batch_size
+    val_freq = cfg.val_freq
+
+    train_loader = DataLoader(train_dataset, batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
+
+    if not cfg.sample_num is None:
+        sample_num = cfg.sample_num if cfg.sample_num < len(train_dataset) else len(train_dataset)
+        sampler = SubsetRandomSampler(torch.randperm(len(train_dataset))[:sample_num])
+        train_loader = DataLoader(train_dataset, batch_size, shuffle=False, sampler=sampler, num_workers=cfg.num_workers, pin_memory=True)
 
     if cfg.dataset_name == "voc":
         val_loader_crop = None
@@ -481,28 +440,22 @@ def my_app(cfg: DictConfig) -> None:
         dataset_name=cfg.dataset_name,
         crop_type=None,
         image_set="val",
-        transform=get_transform(320, False, val_loader_crop),
-        target_transform=get_transform(320, True, val_loader_crop),
+        transform=get_transform(cfg.res, False, val_loader_crop),
+        target_transform=get_transform(cfg.res, True, val_loader_crop),
         mask=True,
         cfg=cfg,
     )
 
-    #val_dataset = MaterializedDataset(val_dataset)
-    train_loader = DataLoader(train_dataset, cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
-
-    if cfg.submitting_to_aml:
-        val_batch_size = 16
-    else:
-        val_batch_size = cfg.batch_size
+    val_batch_size = cfg.batch_size
 
     val_loader = DataLoader(val_dataset, val_batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
     
-    if cfg.checkpoint_file is None:
-        model = LitUnsupervisedSegmenter(train_dataset.n_classes, cfg)
-    else:
-        model = LitUnsupervisedSegmenter.load_from_checkpoint(cfg.output_root + "/checkpoints/" + cfg.checkpoint_file, cfg=cfg)
+    model = LitUnsupervisedSegmenter(cfg.dir_dataset_n_classes, cfg)
+    if not cfg.checkpoint_file is None:
+        checkpoint = LitUnsupervisedSegmenter.load_from_checkpoint(cfg.output_root + "/checkpoints/" + cfg.checkpoint_file, cfg=cfg)
+        model.net = checkpoint.net
 
-    logger = WandbLogger(project="dipterv", log_model="all", name=cfg.run_name)
+    logger = WandbLogger(project="dipterv", log_model=True, name=cfg.run_name)
 
     if cfg.submitting_to_aml:
         gpu_args = dict(gpus=1, val_check_interval=250)
@@ -511,13 +464,26 @@ def my_app(cfg: DictConfig) -> None:
             gpu_args.pop("val_check_interval")
 
     else:
-        gpu_args = dict(gpus=-1, accelerator='cuda', val_check_interval=cfg.val_freq)
-        # gpu_args = dict(gpus=1, accelerator='ddp', val_check_interval=cfg.val_freq)
+        gpu_args = dict(gpus=-1, accelerator='cuda', val_check_interval=val_freq)
 
         if gpu_args["val_check_interval"] > len(train_loader) // 4:
             gpu_args.pop("val_check_interval")
 
-    trainer = Trainer(
+    if not cfg.sample_num is None:
+        trainer = Trainer(
+        log_every_n_steps=cfg.scalar_log_freq,
+        logger=logger,
+        max_epochs=1,
+        callbacks=[
+            ModelCheckpoint(
+                dirpath=join(checkpoint_dir, name),
+                every_n_train_steps=cfg.checkpoint_freq,
+                save_top_k=1
+            )
+        ],
+        **gpu_args)
+    else:
+        trainer = Trainer(
         log_every_n_steps=cfg.scalar_log_freq,
         logger=logger,
         max_steps=cfg.max_steps,
@@ -525,15 +491,12 @@ def my_app(cfg: DictConfig) -> None:
             ModelCheckpoint(
                 dirpath=join(checkpoint_dir, name),
                 every_n_train_steps=cfg.checkpoint_freq,
-                save_top_k=1,
-                monitor=cfg.checkpoint_monitor,
-                mode=cfg.checkpoint_mode,
+                save_top_k=1
             )
         ],
-        **gpu_args
-    )
-    trainer.fit(model, train_loader, val_loader)
+        **gpu_args)
 
+    trainer.fit(model, train_loader, val_loader)
 
 if __name__ == "__main__":
     prep_args()

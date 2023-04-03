@@ -137,8 +137,8 @@ class UnNormalize(object):
         return image2
 
 
-normalize = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-unnorm = UnNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+normalize = T.Normalize([0.22294242, 0.22294242, 0.22294242], [0.18982761, 0.18982761, 0.18982761])
+unnorm = UnNormalize([0.22294242, 0.22294242, 0.22294242],  [0.18982761, 0.18982761, 0.18982761])
 
 
 class ToTargetTensor(object):
@@ -173,14 +173,19 @@ def get_transform(res, is_label, crop_type):
     else:
         raise ValueError("Unknown Cropper {}".format(crop_type))
     if is_label:
-        return T.Compose([T.Resize(res, Image.NEAREST),
-                          cropper,
+        return T.Compose([T.RandomRotation(180, Image.BILINEAR),
+                          T.RandomHorizontalFlip(),
+                          T.RandomResizedCrop(size=res, scale=(0.8, 1.0)),
                           ToTargetTensor()])
     else:
-        return T.Compose([T.Resize(res, Image.NEAREST),
-                          cropper,
+        return T.Compose([
+                          T.RandomRotation(180, Image.BILINEAR),
+                          T.RandomHorizontalFlip(),
+                          T.RandomResizedCrop(size=res, scale=(0.8, 1.0)),
                           T.ToTensor(),
-                          normalize])
+                          normalize
+                         ])
+
 
 
 def _remove_axes(ax):
@@ -201,6 +206,7 @@ def remove_axes(axes):
 
 
 class UnsupervisedMetrics(Metric):
+    
     def __init__(self, prefix: str, n_classes: int, extra_clusters: int, compute_hungarian: bool,
                  dist_sync_on_step=True):
         # call `self.add_state`for every internal state that is needed for the metrics computations
@@ -268,9 +274,15 @@ class UnsupervisedMetrics(Metric):
         iou = tp / (tp + fp + fn)
         prc = tp / (tp + fn)
         opc = torch.sum(tp) / torch.sum(self.histogram)
+        dice = 2 * tp / (2*tp+fp+fn)
+        precision = tp / (tp + fp)
+        recall = tp / (tp + fn)
 
         metric_dict = {self.prefix + "mIoU": iou[~torch.isnan(iou)].mean().item(),
-                       self.prefix + "Accuracy": opc.item()}
+                       self.prefix + "Accuracy": opc.item(),
+                       self.prefix + "Dice": dice[~torch.isnan(dice)].mean().item(),
+                       self.prefix + "Precision": precision[~torch.isnan(precision)].mean().item(),
+                       self.prefix + "Recall": recall[~torch.isnan(recall)].mean().item()}
         return {k: 100 * v for k, v in metric_dict.items()}
 
 

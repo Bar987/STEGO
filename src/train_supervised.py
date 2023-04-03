@@ -1,7 +1,7 @@
 from utils import *
 from modules import *
 from data import *
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler
 import torch.nn.functional as F
 from datetime import datetime
 import hydra
@@ -17,6 +17,7 @@ from pytorch_lightning.loggers import WandbLogger
 import sys
 from crf import dense_crf
 from multiprocessing import Pool
+from segmentation_models_pytorch.losses import *
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -49,8 +50,6 @@ class SupervisedSegmenter(pl.LightningModule):
         self.cluster_probe = ClusterLookup(dim, n_classes + cfg.extra_clusters)
         self.linear_probe = nn.Conv2d(dim, n_classes, (1, 1))
 
-        #self.decoder = nn.Conv2d(dim, self.net.n_feats, (1, 1))
-
         self.cluster_metrics = UnsupervisedMetrics(
             "test/cluster/", n_classes, cfg.extra_clusters, True)
         self.linear_metrics = UnsupervisedMetrics(
@@ -60,13 +59,20 @@ class SupervisedSegmenter(pl.LightningModule):
             "final/cluster/", n_classes, cfg.extra_clusters, True)
         self.test_linear_metrics = UnsupervisedMetrics(
             "final/linear/", n_classes, 0, False)
-
-        self.linear_probe_loss_fn = torch.nn.CrossEntropyLoss()
+        
+        if cfg.linear_loss == 'dice':
+            self.linear_probe_loss_fn = DiceLoss('multiclass', from_logits=True)
+        elif cfg.linear_loss == 'jaccard':
+            self.linear_probe_loss_fn = JaccardLoss('multiclass', from_logits=True)
+        elif cfg.linear_loss == 'focal':
+            self.linear_probe_loss_fn = FocalLoss('multiclass')
+        elif cfg.linear_loss == 'tversky':
+            self.linear_probe_loss_fn = TverskyLoss('multiclass', from_logits=True, alpha=0.3, beta=0.7)
+        else:
+            self.linear_probe_loss_fn = nn.CrossEntropyLoss()
+        
         self.crf_loss_fn = ContrastiveCRFLoss(
             cfg.crf_samples, cfg.alpha, cfg.beta, cfg.gamma, cfg.w1, cfg.w2, cfg.shift)
-
-
-        self.loss_fn = torch.nn.CrossEntropyLoss()
 
         self.automatic_optimization = False
 
@@ -87,6 +93,11 @@ class SupervisedSegmenter(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         # training_step defined the train loop.
         # It is independent of forward
+        if self.cfg.freeze_segmenter:
+            self.net.eval()
+        else:
+            self.net.train()
+
         net_optim, linear_probe_optim, cluster_probe_optim = self.optimizers()
 
         net_optim.zero_grad()
@@ -105,12 +116,31 @@ class SupervisedSegmenter(pl.LightningModule):
         linear_logits = self.linear_probe(code)
         linear_logits = F.interpolate(linear_logits, label.shape[-2:], mode='bilinear', align_corners=False)
         linear_logits = linear_logits.permute(0, 2, 3, 1).reshape(-1, self.n_classes)
-        linear_loss = self.linear_probe_loss_fn(linear_logits[mask], flat_label[mask]).mean()
+
+        if len(flat_label[mask]) > 0:
+            linear_loss = self.linear_probe_loss_fn(linear_logits[mask], flat_label[mask])
+        else:
+            linear_loss = 0
+
         loss += linear_loss
+        self.log('loss/linear', linear_loss, **log_args)
+
+        detached_code = torch.clone(code.detach())
+        cluster_loss, cluster_probs = self.cluster_probe(detached_code, None)
+        loss += cluster_loss
         self.log('loss/total', loss, **log_args)
 
         self.manual_backward(loss)
         net_optim.step()
+        cluster_probe_optim.step()
+        linear_probe_optim.step()
+
+        if self.cfg.reset_probe_steps is not None and self.global_step == self.cfg.reset_probe_steps:
+            print("RESETTING PROBES")
+            self.linear_probe.reset_parameters()
+            self.cluster_probe.reset_parameters()
+            self.trainer.optimizers[1] = torch.optim.Adam(list(self.linear_probe.parameters()), lr=5e-3)
+            self.trainer.optimizers[2] = torch.optim.Adam(list(self.cluster_probe.parameters()), lr=5e-3)
 
         return loss
 
@@ -190,43 +220,12 @@ class SupervisedSegmenter(pl.LightningModule):
                     colors = [self.label_cmap[i] / 255.0 for i in range(len(names))]
                     [t.set_color(colors[i]) for i, t in enumerate(ax.xaxis.get_ticklabels())]
                     [t.set_color(colors[i]) for i, t in enumerate(ax.yaxis.get_ticklabels())]
-                    # ax.yaxis.get_ticklabels()[-1].set_color(self.label_cmap[0] / 255.0)
-                    # ax.xaxis.get_ticklabels()[-1].set_color(self.label_cmap[0] / 255.0)
                     plt.xticks(rotation=90)
                     plt.yticks(rotation=0)
                     ax.vlines(np.arange(0, len(names) + 1), color=[.5, .5, .5], *ax.get_xlim())
                     ax.hlines(np.arange(0, len(names) + 1), color=[.5, .5, .5], *ax.get_ylim())
                     plt.tight_layout()
                     add_plot(self.logger, "conf_matrix", self.global_step)
-
-                    # all_bars = torch.cat([
-                    #     self.cluster_metrics.histogram.sum(0).cpu(),
-                    #     self.cluster_metrics.histogram.sum(1).cpu()
-                    # ], axis=0)
-                    # ymin = max(all_bars.min() * .8, 1)
-                    # ymax = all_bars.max() * 1.2
-
-                    # fig, ax = plt.subplots(1, 2, figsize=(2 * 5, 1 * 4))
-                    # ax[0].bar(range(self.n_classes + self.cfg.extra_clusters),
-                    #           self.cluster_metrics.histogram.sum(0).cpu(),
-                    #           tick_label=names,
-                    #           color=colors)
-                    # ax[0].set_ylim(ymin, ymax)
-                    # ax[0].set_title("Label Frequency")
-                    # ax[0].set_yscale('log')
-                    # ax[0].tick_params(axis='x', labelrotation=90)
-
-                    # ax[1].bar(range(self.n_classes + self.cfg.extra_clusters),
-                    #           self.cluster_metrics.histogram.sum(1).cpu(),
-                    #           tick_label=names,
-                    #           color=colors)
-                    # ax[1].set_ylim(ymin, ymax)
-                    # ax[1].set_title("Cluster Frequency")
-                    # ax[1].set_yscale('log')
-                    # ax[1].tick_params(axis='x', labelrotation=90)
-
-                    # plt.tight_layout()
-                    # add_plot(self.logger, "label frequency", self.global_step)
 
             if self.global_step > 2:
                 self.log_dict(tb_metrics)
@@ -299,6 +298,16 @@ def my_app(cfg: DictConfig) -> None:
         transform=get_transform(cfg.res, False, cfg.loader_crop_type),
         target_transform=get_transform(cfg.res, True, cfg.loader_crop_type)
     )
+    
+    batch_size = cfg.batch_size
+    val_freq = cfg.val_freq
+
+    train_loader = DataLoader(train_dataset, batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
+
+    if not cfg.sample_num is None:
+        sample_num = cfg.sample_num if cfg.sample_num < len(train_dataset) else len(train_dataset)
+        sampler = SubsetRandomSampler(torch.randperm(len(train_dataset))[:sample_num])
+        train_loader = DataLoader(train_dataset, batch_size, shuffle=False, sampler=sampler, num_workers=cfg.num_workers, pin_memory=True)
 
     if cfg.dataset_name == "voc":
         val_loader_crop = None
@@ -309,24 +318,22 @@ def my_app(cfg: DictConfig) -> None:
         root=pytorch_data_dir,
         path=cfg.dir_dataset_name,
         image_set="val",
-        transform=get_transform(320, False, val_loader_crop),
-        target_transform=get_transform(320, True, val_loader_crop),
+        transform=get_transform(cfg.res, False, val_loader_crop),
+        target_transform=get_transform(cfg.res, True, val_loader_crop),
     )
 
-    #val_dataset = MaterializedDataset(val_dataset)
-    train_loader = DataLoader(train_dataset, cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
 
 
     val_batch_size = cfg.batch_size
 
     val_loader = DataLoader(val_dataset, val_batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
 
-    if cfg.checkpoint_file is None:
-        model = SupervisedSegmenter(cfg.dir_dataset_n_classes, cfg)
-    else:
-        model = SupervisedSegmenter.load_from_checkpoint(cfg.output_root + "/checkpoints/" + cfg.checkpoint_file, cfg=cfg)
+    model = SupervisedSegmenter(cfg.dir_dataset_n_classes, cfg)
+    if not cfg.checkpoint_file is None:
+        checkpoint = SupervisedSegmenter.load_from_checkpoint(cfg.output_root + "/checkpoints/" + cfg.checkpoint_file, cfg=cfg, strict=False)
+        model.net = checkpoint.net
 
-    logger = WandbLogger(project="dipterv", log_model="all", name=cfg.run_name)
+    logger = WandbLogger(project="dipterv", log_model=True, name=cfg.run_name)
 
     if cfg.submitting_to_aml:
         gpu_args = dict(gpus=1, val_check_interval=250)
@@ -335,27 +342,44 @@ def my_app(cfg: DictConfig) -> None:
             gpu_args.pop("val_check_interval")
 
     else:
-        gpu_args = dict(gpus=-1, accelerator='cuda', val_check_interval=cfg.val_freq)
-        # gpu_args = dict(gpus=1, accelerator='ddp', val_check_interval=cfg.val_freq)
+        gpu_args = dict(gpus=-1, accelerator='cuda', val_check_interval=val_freq)
 
         if gpu_args["val_check_interval"] > len(train_loader) // 4:
             gpu_args.pop("val_check_interval")
 
-    trainer = Trainer(
-        log_every_n_steps=cfg.scalar_log_freq,
-        logger=logger,
-        max_steps=cfg.max_steps,
-        callbacks=[
-            ModelCheckpoint(
-                dirpath=join(checkpoint_dir, name),
-                every_n_train_steps=400,
-                save_top_k=2,
-                monitor="test/linear/mIoU",
-                mode="max",
-            )
-        ],
-        **gpu_args
-    )
+    if not cfg.sample_num is None:
+        trainer = Trainer(
+            log_every_n_steps=cfg.scalar_log_freq,
+            logger=logger,
+            max_epochs=1,
+            callbacks=[
+                ModelCheckpoint(
+                    dirpath=join(checkpoint_dir, name),
+                    every_n_train_steps=400,
+                    save_top_k=1,
+                    monitor="test/linear/mIoU",
+                    mode="max",
+                )
+            ],
+            **gpu_args
+        )
+    else:
+        trainer = Trainer(
+            log_every_n_steps=cfg.scalar_log_freq,
+            logger=logger,
+            max_steps=cfg.max_steps,
+            callbacks=[
+                ModelCheckpoint(
+                    dirpath=join(checkpoint_dir, name),
+                    every_n_train_steps=400,
+                    save_top_k=1,
+                    monitor="test/linear/mIoU",
+                    mode="max",
+                )
+            ],
+            **gpu_args
+        )
+        
     trainer.fit(model, train_loader, val_loader)
 
 
