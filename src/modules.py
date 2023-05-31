@@ -3,6 +3,7 @@ import torch
 from utils import *
 import torch.nn.functional as F
 import dino.vision_transformer as vits
+import timm
 
 
 class LambdaLayer(nn.Module):
@@ -41,24 +42,8 @@ class DinoFeaturizer(nn.Module):
         else:
             raise ValueError("Unknown arch and patch size")
         
-        if cfg.is_pretrained:
-            if cfg.pretrained_weights is not None:
-                state_dict = torch.load(cfg.pretrained_weights, map_location="cpu")
-                state_dict = state_dict["teacher"]
-                # remove `module.` prefix
-                state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-                # remove `backbone.` prefix induced by multicrop wrapper
-                state_dict = {k.replace("backbone.", ""): v for k, v in state_dict.items()}
-
-                # state_dict = {k.replace("projection_head", "mlp"): v for k, v in state_dict.items()}
-                # state_dict = {k.replace("prototypes", "last_layer"): v for k, v in state_dict.items()}
-
-                msg = self.model.load_state_dict(state_dict, strict=False)
-                print('Pretrained weights found at {} and loaded with msg: {}'.format(cfg.pretrained_weights, msg))
-            else:
-                print("Since no pretrained weights have been provided, we load the reference pretrained DINO weights.")
-                state_dict = torch.hub.load_state_dict_from_url(url="https://dl.fbaipublicfiles.com/dino/" + url)
-                self.model.load_state_dict(state_dict, strict=True)
+        state_dict = torch.hub.load_state_dict_from_url(url="https://dl.fbaipublicfiles.com/dino/" + url)
+        self.model.load_state_dict(state_dict, strict=True)
 
         if arch == "vit_small":
             self.n_feats = 384
@@ -68,10 +53,15 @@ class DinoFeaturizer(nn.Module):
         self.cluster1 = self.make_clusterer(self.n_feats)
         self.cluster2 = self.make_nonlinear_clusterer(self.n_feats)
 
+        #making possible the freezing of different parts of the net by config
         if cfg.freeze_backbone:
             for p in self.model.parameters():
                 p.requires_grad = False
             self.model.eval().cuda()
+            if not cfg.freeze_embedding:
+                for p in self.model.patch_embed.parameters():
+                    p.requires_grad = True
+                self.model.patch_embed.train().cuda()
         else:
             self.model.cuda()
 
@@ -127,10 +117,6 @@ class DinoFeaturizer(nn.Module):
 
         if self.feat_type == "feat":
             image_feat = feat[:, 1:, :].reshape(feat.shape[0], feat_h, feat_w, -1).permute(0, 3, 1, 2)
-        elif self.feat_type == "KK":
-            image_k = qkv[1, :, :, 1:, :].reshape(feat.shape[0], 6, feat_h, feat_w, -1)
-            B, H, I, J, D = image_k.shape
-            image_feat = image_k.permute(0, 1, 4, 2, 3).reshape(B, H * D, I, J)
         else:
             raise ValueError("Unknown feat type:{}".format(self.feat_type))
 
@@ -144,18 +130,6 @@ class DinoFeaturizer(nn.Module):
             return self.dropout(image_feat), code
         else:
             return image_feat, code
-
-class ResizeAndClassify(nn.Module):
-
-    def __init__(self, dim: int, size: int, n_classes: int):
-        super(ResizeAndClassify, self).__init__()
-        self.size = size
-        self.predictor = torch.nn.Sequential(
-            torch.nn.Conv2d(dim, n_classes, (1, 1)),
-            torch.nn.LogSoftmax(1))
-
-    def forward(self, x):
-        return F.interpolate(self.predictor.forward(x), self.size, mode="bilinear", align_corners=False)
 
 
 class ClusterLookup(nn.Module):
@@ -187,118 +161,85 @@ class ClusterLookup(nn.Module):
         else:
             return cluster_loss, cluster_probs
 
+# class for wrapping the convolutional network used for comparison
+class CustomFeaturizer(nn.Module):
 
-class FeaturePyramidNet(nn.Module):
+    def __init__(self, dim, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.dim = dim
+        self.model = timm.create_model('convnext_small', pretrained=True, num_classes=0, global_pool='')
+        
+        self.dropout = torch.nn.Dropout2d(p=.1)
 
-    @staticmethod
-    def _helper(x):
-        # TODO remove this hard coded 56
-        return F.interpolate(x, 56, mode="bilinear", align_corners=False).unsqueeze(-1)
+        self.n_feats = 768
+
+        self.cluster1 = self.make_clusterer(self.n_feats)
+        self.cluster2 = self.make_nonlinear_clusterer(self.n_feats)
+
+        if cfg.freeze_backbone:
+            for p in self.model.parameters():
+                p.requires_grad = False
+            self.model.eval().cuda()
+            
+            if not cfg.freeze_embedding:
+                for p in self.model.patch_embed.parameters():
+                    p.requires_grad = True
+                self.model.patch_embed.train().cuda()
+        else:
+            self.model.cuda()
+
+        if self.cfg.freeze_segmenter:
+            for p in self.cluster1.parameters():
+                p.requires_grad = False
+            self.cluster1.eval().cuda()
+            for p in self.cluster2.parameters():
+                p.requires_grad = False
+            self.cluster2.eval().cuda()
+        else:
+            self.cluster1.cuda()
+            self.cluster2.cuda()
+
+        
 
     def make_clusterer(self, in_channels):
         return torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels, self.dim, (1, 1)),
-            LambdaLayer(FeaturePyramidNet._helper))
+            torch.nn.Conv2d(in_channels, self.dim, (1, 1)))  # ,
 
     def make_nonlinear_clusterer(self, in_channels):
         return torch.nn.Sequential(
             torch.nn.Conv2d(in_channels, in_channels, (1, 1)),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(in_channels, in_channels, (1, 1)),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(in_channels, self.dim, (1, 1)),
-            LambdaLayer(FeaturePyramidNet._helper))
+            torch.nn.Conv2d(in_channels, self.dim, (1, 1)))
 
-    def __init__(self, granularity, cut_model, dim, continuous):
-        super(FeaturePyramidNet, self).__init__()
-        self.layer_nums = [5, 6, 7]
-        self.spatial_resolutions = [7, 14, 28, 56]
-        self.feat_channels = [2048, 1024, 512, 3]
-        self.extra_channels = [128, 64, 32, 32]
-        self.granularity = granularity
-        self.encoder = NetWithActivations(cut_model, self.layer_nums)
-        self.dim = dim
-        self.continuous = continuous
-        self.n_feats = self.dim
-
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-
-        assert granularity in {1, 2, 3, 4}
-        self.cluster1 = self.make_clusterer(self.feat_channels[0])
-        self.cluster1_nl = self.make_nonlinear_clusterer(self.feat_channels[0])
-
-        if granularity >= 2:
-            # self.conv1 = DoubleConv(self.feat_channels[0], self.extra_channels[0])
-            # self.conv2 = DoubleConv(self.extra_channels[0] + self.feat_channels[1], self.extra_channels[1])
-            self.conv2 = DoubleConv(self.feat_channels[0] + self.feat_channels[1], self.extra_channels[1])
-            self.cluster2 = self.make_clusterer(self.extra_channels[1])
-        if granularity >= 3:
-            self.conv3 = DoubleConv(self.extra_channels[1] + self.feat_channels[2], self.extra_channels[2])
-            self.cluster3 = self.make_clusterer(self.extra_channels[2])
-        if granularity >= 4:
-            self.conv4 = DoubleConv(self.extra_channels[2] + self.feat_channels[3], self.extra_channels[3])
-            self.cluster4 = self.make_clusterer(self.extra_channels[3])
-
-    def c(self, x, y):
-        return torch.cat([x, y], dim=1)
-
-    def forward(self, x):
-        with torch.no_grad():
-            feats = self.encoder(x)
-        low_res_feats = feats[self.layer_nums[-1]]
-
-        all_clusters = []
-
-        # all_clusters.append(self.cluster1(low_res_feats) + self.cluster1_nl(low_res_feats))
-        all_clusters.append(self.cluster1(low_res_feats))
-
-        if self.granularity >= 2:
-            # f1 = self.conv1(low_res_feats)
-            # f1_up = self.up(f1)
-            f1_up = self.up(low_res_feats)
-            f2 = self.conv2(self.c(f1_up, feats[self.layer_nums[-2]]))
-            all_clusters.append(self.cluster2(f2))
-        if self.granularity >= 3:
-            f2_up = self.up(f2)
-            f3 = self.conv3(self.c(f2_up, feats[self.layer_nums[-3]]))
-            all_clusters.append(self.cluster3(f3))
-        if self.granularity >= 4:
-            f3_up = self.up(f3)
-            final_size = self.spatial_resolutions[-1]
-            f4 = self.conv4(self.c(f3_up, F.interpolate(
-                x, (final_size, final_size), mode="bilinear", align_corners=False)))
-            all_clusters.append(self.cluster4(f4))
-
-        avg_code = torch.cat(all_clusters, 4).mean(4)
-
-        if self.continuous:
-            clusters = avg_code
+    def forward(self, img):
+        if self.cfg.freeze_backbone:
+            self.model.eval()
+            with torch.no_grad():
+                image_feat = self.model_forward(img)
         else:
-            clusters = torch.log_softmax(avg_code, 1)
+            image_feat = self.model_forward(img)
 
-        return low_res_feats, clusters
+        if self.cfg.freeze_segmenter:
+            self.cluster1.eval()
+            self.cluster2.eval()
+            with torch.no_grad():
+                return self.segmenter_forward(image_feat)
+        else:
+            return self.segmenter_forward(image_feat)
 
+    def model_forward(self, img):
+        return self.model(img)
 
-class DoubleConv(nn.Module):
-    """(convolution => [BN] => ReLU) * 2"""
+    def segmenter_forward(self, image_feat):
+        code = self.cluster1(self.dropout(image_feat))
+        code += self.cluster2(self.dropout(image_feat))
 
-    def __init__(self, in_channels, out_channels, mid_channels=None):
-        super().__init__()
-        if not mid_channels:
-            mid_channels = out_channels
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU()
-        )
-
-    def forward(self, x):
-        return self.double_conv(x)
-
-
+        if self.cfg.dropout:
+            return self.dropout(image_feat), code
+        else:
+            return image_feat, code
+    
 def norm(t):
     return F.normalize(t, dim=1, eps=1e-10)
 
@@ -337,7 +278,7 @@ def sample_nonzero_locations(t, target_size):
     coords = coords * 2 - 1
     return torch.flip(coords, dims=[-1])
 
-
+# class implementing the contrastive correlation loss function used for training STEGO model in a self-supervised way
 class ContrastiveCorrelationLoss(nn.Module):
 
     def __init__(self, cfg, ):
@@ -380,18 +321,8 @@ class ContrastiveCorrelationLoss(nn.Module):
                 ):
 
         coord_shape = [orig_feats.shape[0], self.cfg.feature_samples, self.cfg.feature_samples, 2]
-
-        if self.cfg.use_salience:
-            coords1_nonzero = sample_nonzero_locations(orig_salience, coord_shape)
-            coords2_nonzero = sample_nonzero_locations(orig_salience_pos, coord_shape)
-            coords1_reg = torch.rand(coord_shape, device=orig_feats.device) * 2 - 1
-            coords2_reg = torch.rand(coord_shape, device=orig_feats.device) * 2 - 1
-            mask = (torch.rand(coord_shape[:-1], device=orig_feats.device) > .1).unsqueeze(-1).to(torch.float32)
-            coords1 = coords1_nonzero * mask + coords1_reg * (1 - mask)
-            coords2 = coords2_nonzero * mask + coords2_reg * (1 - mask)
-        else:
-            coords1 = torch.rand(coord_shape, device=orig_feats.device) * 2 - 1
-            coords2 = torch.rand(coord_shape, device=orig_feats.device) * 2 - 1
+        coords1 = torch.rand(coord_shape, device=orig_feats.device) * 2 - 1
+        coords2 = torch.rand(coord_shape, device=orig_feats.device) * 2 - 1
 
         feats = sample(orig_feats, coords1)
         code = sample(orig_code, coords1)
@@ -423,74 +354,3 @@ class ContrastiveCorrelationLoss(nn.Module):
                 pos_inter_cd,
                 neg_inter_loss,
                 neg_inter_cd)
-
-
-class Decoder(nn.Module):
-    def __init__(self, code_channels, feat_channels):
-        super().__init__()
-        self.linear = torch.nn.Conv2d(code_channels, feat_channels, (1, 1))
-        self.nonlinear = torch.nn.Sequential(
-            torch.nn.Conv2d(code_channels, code_channels, (1, 1)),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(code_channels, code_channels, (1, 1)),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(code_channels, feat_channels, (1, 1)))
-
-    def forward(self, x):
-        return self.linear(x) + self.nonlinear(x)
-
-
-class NetWithActivations(torch.nn.Module):
-    def __init__(self, model, layer_nums):
-        super(NetWithActivations, self).__init__()
-        self.layers = nn.ModuleList(model.children())
-        self.layer_nums = []
-        for l in layer_nums:
-            if l < 0:
-                self.layer_nums.append(len(self.layers) + l)
-            else:
-                self.layer_nums.append(l)
-        self.layer_nums = set(sorted(self.layer_nums))
-
-    def forward(self, x):
-        activations = {}
-        for ln, l in enumerate(self.layers):
-            x = l(x)
-            if ln in self.layer_nums:
-                activations[ln] = x
-        return activations
-
-
-class ContrastiveCRFLoss(nn.Module):
-
-    def __init__(self, n_samples, alpha, beta, gamma, w1, w2, shift):
-        super(ContrastiveCRFLoss, self).__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.w1 = w1
-        self.w2 = w2
-        self.n_samples = n_samples
-        self.shift = shift
-
-    def forward(self, guidance, clusters):
-        device = clusters.device
-        assert (guidance.shape[0] == clusters.shape[0])
-        assert (guidance.shape[2:] == clusters.shape[2:])
-        h = guidance.shape[2]
-        w = guidance.shape[3]
-
-        coords = torch.cat([
-            torch.randint(0, h, size=[1, self.n_samples], device=device),
-            torch.randint(0, w, size=[1, self.n_samples], device=device)], 0)
-
-        selected_guidance = guidance[:, :, coords[0, :], coords[1, :]]
-        coord_diff = (coords.unsqueeze(-1) - coords.unsqueeze(1)).square().sum(0).unsqueeze(0)
-        guidance_diff = (selected_guidance.unsqueeze(-1) - selected_guidance.unsqueeze(2)).square().sum(1)
-
-        sim_kernel = self.w1 * torch.exp(- coord_diff / (2 * self.alpha) - guidance_diff / (2 * self.beta)) + \
-                     self.w2 * torch.exp(- coord_diff / (2 * self.gamma)) - self.shift
-
-        selected_clusters = clusters[:, :, coords[0, :], coords[1, :]]
-        cluster_sims = torch.einsum("nka,nkb->nab", selected_clusters, selected_clusters)
-        return -(cluster_sims * sim_kernel)

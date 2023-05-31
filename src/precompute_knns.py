@@ -8,7 +8,6 @@ import torch.multiprocessing
 import torch.multiprocessing
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.utilities.seed import seed_everything
 from tqdm import tqdm
 
 
@@ -21,7 +20,7 @@ def get_feats(model, loader):
     return torch.cat(all_feats, dim=0).contiguous()
 
 
-@hydra.main(config_path="configs", config_name="train_config.yml")
+@hydra.main(config_path="configs", config_name="self_supervised_config.yml")
 def my_app(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
     pytorch_data_dir = cfg.pytorch_data_dir
@@ -31,16 +30,10 @@ def my_app(cfg: DictConfig) -> None:
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(join(pytorch_data_dir, "nns"), exist_ok=True)
 
-    seed_everything(seed=0)
-
     print(data_dir)
     print(cfg.output_root)
 
     image_sets = ["val", "train"]
-    dataset_names = ["cocostuff27", "cityscapes", "potsdam"]
-    crop_types = ["five", None]
-
-    # Uncomment these lines to run on custom datasets
     dataset_names = ["directory"]
     crop_types = [None]
 
@@ -54,8 +47,11 @@ def my_app(cfg: DictConfig) -> None:
             LambdaLayer(lambda p: p[0]),
         ).cuda()
     else:
-        cut_model = load_model(cfg.model_type, join(cfg.output_root, "data")).cuda()
-        no_ap_model = nn.Sequential(*list(cut_model.children())[:-1]).cuda()
+        from modules import CustomFeaturizer, LambdaLayer
+        no_ap_model = torch.nn.Sequential(
+            CustomFeaturizer(20, cfg),
+            LambdaLayer(lambda p: p[0]),
+        ).cuda()
     par_model = torch.nn.DataParallel(no_ap_model)
 
     for crop_type in crop_types:
@@ -78,7 +74,7 @@ def my_app(cfg: DictConfig) -> None:
                         cfg=cfg,
                     )
 
-                    loader = DataLoader(dataset, 256, shuffle=False, num_workers=cfg.num_workers, pin_memory=False)
+                    loader = DataLoader(dataset, 128, shuffle=False, num_workers=cfg.num_workers, pin_memory=False)
 
                     with torch.no_grad():
                         normed_feats = get_feats(par_model, loader)

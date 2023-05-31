@@ -1,0 +1,87 @@
+output_root: '/content/pytorch-data'
+pytorch_data_dir: '/content/pytorch-data'
+experiment_name: "exp1"
+log_dir: "self-supervised"
+checkpoint_file: ~
+is_pretrained: True
+freeze_backbone: True
+freeze_embedding: True
+freeze_segmenter: False
+checkpoint_monitor: "loss/total"
+checkpoint_mode: "min"
+sample_num: ~
+reset_probe_steps: ~
+val_freq: 1000
+usable_data_ratio: ~
+finetune: False
+checkpoint_freq: 3000
+
+lr: 1e-4
+optim: 'adam'
+clr: False
+
+# Loader params
+num_workers: 10
+max_epochs: 20
+batch_size: 16
+
+num_neighbors: 7
+dataset_name: "directory"
+
+# Used if dataset_name is "directory"
+dir_dataset_name: "all-imgs"
+dir_dataset_n_classes: 4
+clustering_classes: 20
+run_name: ""
+
+has_labels: False
+crop_type: None
+crop_ratio: .5
+res: 200
+loader_crop_type: "center"
+
+# Model Params
+extra_clusters: -1
+model_type: "vit_small"
+arch: "dino"
+dino_feat_type: "feat"
+projection_type: "nonlinear"
+dino_patch_size: 8
+granularity: 1
+continuous: True
+dim: 70
+dropout: True
+zero_clamp: True
+stabalize: True
+
+stop_at_zero: True
+
+# Feature Contrastive params
+pointwise: True
+feature_samples: 11
+neg_samples: 5
+aug_alignment_weight: 0.0
+
+correspondence_weight: 1.0
+
+
+# IAROA vit small 1/31/22
+neg_inter_weight: 0.63
+pos_inter_weight: 0.25
+pos_intra_weight: 0.67
+neg_inter_shift: 0.46
+pos_inter_shift: 0.12
+pos_intra_shift: 0.18
+
+# Logging params
+n_images: 4
+scalar_log_freq: 10
+hist_freq:
+
+
+hydra:
+  run:
+    dir: "."
+  output_subdir: ~
+  #job_logging: "disabled"
+  #hydra_logging: "disabled"
