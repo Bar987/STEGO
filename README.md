@@ -2,7 +2,7 @@
 
 	
 Self-supervised training example in Google Colab:
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mhamilton723/STEGO/blob/master/src/STEGO_Colab_Demo.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1YiSR7tm2fkHgyM1SEsXdUngqLRvhBL3a?usp=sharing)
 
 
 Original repo, that this repo is based on can be found at: https://github.com/mhamilton723/STEGO.
