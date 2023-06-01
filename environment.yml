@@ -1,7 +1,8 @@
+name: dipterv
 channels:
-- anaconda
-- pytorch
 - conda-forge
+- pytorch
+- anaconda
 - menpo
 dependencies:
 - python=3.6.9
@@ -34,4 +35,4 @@ dependencies:
   - pydensecrf
   - setuptools==59.5.0
   - pyDeprecate==0.3.1
-name: stego
+  - wandb
